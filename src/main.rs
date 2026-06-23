@@ -79,12 +79,14 @@ fn ingest(args: IngestArgs) -> Result<()> {
     match args.output {
         Some(output) => {
             let store = JsonlStorage::create(&output)?;
-            let (report, store) = run_pipeline(store, chunker, &args.input)?;
+            // Exclude the output file so it is not re-ingested if it lives inside the
+            // directory being ingested (e.g. `--output docs/chunks.txt docs`).
+            let (report, store) = run_pipeline(store, chunker, &args.input, Some(&output))?;
             print_report(&report);
             println!("Wrote {} chunk(s) to {}", store.len()?, output.display());
         }
         None => {
-            let (report, _) = run_pipeline(InMemoryStorage::new(), chunker, &args.input)?;
+            let (report, _) = run_pipeline(InMemoryStorage::new(), chunker, &args.input, None)?;
             print_report(&report);
         }
     }
@@ -93,13 +95,18 @@ fn ingest(args: IngestArgs) -> Result<()> {
 }
 
 /// Build a pipeline around `store`, ingest `input`, flush, and return the report along
-/// with the (now populated) store.
+/// with the (now populated) store. `exclude`, when set, is omitted from directory walks.
 fn run_pipeline<S: ChunkStore>(
     store: S,
     chunker: FixedSizeChunker,
     input: &Path,
+    exclude: Option<&Path>,
 ) -> Result<(IngestReport, S)> {
-    let mut pipeline = IngestionPipeline::builder(store).chunker(chunker).build();
+    let mut builder = IngestionPipeline::builder(store).chunker(chunker);
+    if let Some(path) = exclude {
+        builder = builder.exclude(path);
+    }
+    let mut pipeline = builder.build();
     let report = pipeline.ingest_path(input)?;
     pipeline.flush()?;
     Ok((report, pipeline.into_store()))

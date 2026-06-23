@@ -43,6 +43,7 @@ pub struct IngestionPipeline<S: ChunkStore> {
     loaders: LoaderRegistry,
     chunker: Box<dyn Chunker>,
     store: S,
+    excludes: Vec<PathBuf>,
 }
 
 impl<S: ChunkStore> IngestionPipeline<S> {
@@ -93,8 +94,21 @@ impl<S: ChunkStore> IngestionPipeline<S> {
         let mut files = Vec::new();
         collect_files(dir, &mut files)?;
 
+        // Resolve excluded paths to their canonical form once so the comparison is
+        // robust to relative-vs-absolute and `.`/symlink differences. This is what
+        // keeps the pipeline from ingesting its own output file when that file lives
+        // inside the directory being ingested.
+        let excluded: Vec<PathBuf> = self
+            .excludes
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect();
+
         let mut report = IngestReport::default();
         for path in files {
+            if is_excluded(&path, &excluded) {
+                continue;
+            }
             if !self.loaders.supports(&path) {
                 report.files_skipped += 1;
                 continue;
@@ -120,6 +134,14 @@ impl<S: ChunkStore> IngestionPipeline<S> {
     /// Consume the pipeline and return the underlying store.
     pub fn into_store(self) -> S {
         self.store
+    }
+}
+
+/// Whether `path` resolves to one of the already-canonicalized `excluded` paths.
+fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => excluded.contains(&canonical),
+        Err(_) => false,
     }
 }
 
@@ -173,6 +195,7 @@ pub struct PipelineBuilder<S: ChunkStore> {
     loaders: Option<LoaderRegistry>,
     chunker: Option<Box<dyn Chunker>>,
     store: S,
+    excludes: Vec<PathBuf>,
 }
 
 impl<S: ChunkStore> PipelineBuilder<S> {
@@ -182,6 +205,7 @@ impl<S: ChunkStore> PipelineBuilder<S> {
             loaders: None,
             chunker: None,
             store,
+            excludes: Vec::new(),
         }
     }
 
@@ -197,6 +221,15 @@ impl<S: ChunkStore> PipelineBuilder<S> {
         self
     }
 
+    /// Exclude `path` from directory ingestion (matched by canonical path).
+    ///
+    /// Typically used to stop the pipeline from ingesting its own output file when
+    /// that file is written inside the directory being ingested.
+    pub fn exclude(mut self, path: impl Into<PathBuf>) -> Self {
+        self.excludes.push(path.into());
+        self
+    }
+
     /// Finish building the pipeline.
     pub fn build(self) -> IngestionPipeline<S> {
         IngestionPipeline {
@@ -205,6 +238,7 @@ impl<S: ChunkStore> PipelineBuilder<S> {
                 .chunker
                 .unwrap_or_else(|| Box::new(FixedSizeChunker::default())),
             store: self.store,
+            excludes: self.excludes,
         }
     }
 }
@@ -291,5 +325,23 @@ mod tests {
 
         // a.txt, link.txt, target.txt — the symlinked directory is skipped.
         assert_eq!(report.files_ingested, 3);
+    }
+
+    #[test]
+    fn excluded_output_file_is_not_ingested() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("input.txt"), "real input body here").unwrap();
+        // An (empty) output file living inside the ingested directory, as would be
+        // created when `--output` points at a `.txt` under the input directory.
+        let output = dir.path().join("chunks.txt");
+        std::fs::write(&output, "").unwrap();
+
+        let mut pipeline = IngestionPipeline::builder(InMemoryStorage::new())
+            .exclude(&output)
+            .build();
+        // Without the exclusion, the empty `chunks.txt` would trigger EmptyDocument.
+        let report = pipeline.ingest_path(dir.path()).unwrap();
+
+        assert_eq!(report.files_ingested, 1); // only input.txt
     }
 }
