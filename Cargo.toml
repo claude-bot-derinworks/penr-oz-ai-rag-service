@@ -1,0 +1,19 @@
+[package]
+name = "penr-oz-ai-rag-service"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Retrieval augmented generation service for AI"
+license = "MIT"
+repository = "https://github.com/derinworks/penr-oz-ai-rag-service"
+
+[lib]
+name = "rag_service"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
