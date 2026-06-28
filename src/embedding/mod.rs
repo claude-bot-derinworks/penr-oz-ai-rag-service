@@ -16,7 +16,7 @@
 //!
 //! # async fn run() -> Result<(), penr_oz_ai_rag_service::EmbeddingError> {
 //! let provider = MockEmbeddingProvider::new();
-//! let vectors = provider.embed(&["hello".to_string(), "world".to_string()]).await?;
+//! let vectors = provider.embed(&["hello", "world"]).await?;
 //!
 //! assert_eq!(vectors.len(), 2);
 //! assert_eq!(vectors[0].len(), provider.dimensions());
@@ -45,10 +45,13 @@ pub trait EmbeddingProvider: Send + Sync {
     /// [`dimensions`](EmbeddingProvider::dimensions) components. An empty `inputs`
     /// slice yields an empty result without contacting the backend.
     ///
+    /// Inputs are taken as `&[&str]` so callers that already hold borrowed text — the
+    /// common case when embedding chunk content — need not allocate owned `String`s.
+    ///
     /// # Errors
     /// Returns [`EmbeddingError`] when the provider rejects an input or the backend
     /// fails to produce embeddings.
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+    async fn embed(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
 
     /// The number of components in every vector this provider produces.
     fn dimensions(&self) -> usize;

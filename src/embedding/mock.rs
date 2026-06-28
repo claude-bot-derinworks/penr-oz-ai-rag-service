@@ -75,7 +75,13 @@ impl Default for MockEmbeddingProvider {
 
 #[async_trait]
 impl EmbeddingProvider for MockEmbeddingProvider {
-    async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        // Per the trait contract, an empty batch yields an empty result without
+        // contacting the backend — so this short-circuits before the failure mode.
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
         if let Some(message) = &self.failure {
             return Err(EmbeddingError::Provider {
                 provider: Self::NAME.to_string(),
@@ -84,7 +90,7 @@ impl EmbeddingProvider for MockEmbeddingProvider {
         }
 
         let mut embeddings = Vec::with_capacity(inputs.len());
-        for (index, input) in inputs.iter().enumerate() {
+        for (index, &input) in inputs.iter().enumerate() {
             if input.is_empty() {
                 return Err(EmbeddingError::EmptyInput { index });
             }
@@ -117,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn embeds_a_batch_preserving_length_and_dimensions() {
         let provider = MockEmbeddingProvider::new().with_dimensions(4);
-        let inputs = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let inputs = ["alpha", "beta", "gamma"];
 
         let vectors = provider.embed(&inputs).await.unwrap();
 
@@ -129,11 +135,7 @@ mod tests {
     #[tokio::test]
     async fn is_deterministic_and_input_dependent() {
         let provider = MockEmbeddingProvider::new();
-        let inputs = vec![
-            "same".to_string(),
-            "same".to_string(),
-            "different".to_string(),
-        ];
+        let inputs = ["same", "same", "different"];
 
         let vectors = provider.embed(&inputs).await.unwrap();
 
@@ -152,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn empty_input_is_rejected_with_its_index() {
         let provider = MockEmbeddingProvider::new();
-        let inputs = vec!["ok".to_string(), String::new()];
+        let inputs = ["ok", ""];
 
         match provider.embed(&inputs).await {
             Err(EmbeddingError::EmptyInput { index }) => assert_eq!(index, 1),
@@ -164,7 +166,7 @@ mod tests {
     async fn failing_provider_surfaces_a_provider_error() {
         let provider = MockEmbeddingProvider::failing("rate limited");
 
-        match provider.embed(&["hi".to_string()]).await {
+        match provider.embed(&["hi"]).await {
             Err(EmbeddingError::Provider { provider, message }) => {
                 assert_eq!(provider, "mock");
                 assert_eq!(message, "rate limited");
@@ -174,9 +176,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_batch_short_circuits_even_when_failing() {
+        // The empty-batch contract takes precedence over the failure mode: an empty
+        // slice never "contacts the backend", so it cannot fail.
+        let provider = MockEmbeddingProvider::failing("should not be reached");
+        assert!(provider.embed(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn usable_as_a_trait_object() {
         let provider: Box<dyn EmbeddingProvider> = Box::new(MockEmbeddingProvider::new());
-        let vectors = provider.embed(&["boxed".to_string()]).await.unwrap();
+        let vectors = provider.embed(&["boxed"]).await.unwrap();
         assert_eq!(vectors[0].len(), provider.dimensions());
     }
 }

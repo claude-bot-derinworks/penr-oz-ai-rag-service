@@ -15,10 +15,7 @@ fn provider_for(name: &str) -> Box<dyn EmbeddingProvider> {
 #[tokio::test]
 async fn embeds_chunk_text_through_a_trait_object() {
     let provider = provider_for("mock");
-    let inputs = vec![
-        "Retrieval augmented generation".to_string(),
-        "ingests documents".to_string(),
-    ];
+    let inputs = ["Retrieval augmented generation", "ingests documents"];
 
     let vectors = provider.embed(&inputs).await.expect("embedding succeeds");
 
@@ -30,7 +27,7 @@ async fn embeds_chunk_text_through_a_trait_object() {
 async fn provider_errors_are_reported_clearly() {
     let provider = provider_for("does-not-exist");
 
-    match provider.embed(&["anything".to_string()]).await {
+    match provider.embed(&["anything"]).await {
         Err(EmbeddingError::Provider { provider, message }) => {
             assert_eq!(provider, "mock");
             assert_eq!(message, "unknown provider");

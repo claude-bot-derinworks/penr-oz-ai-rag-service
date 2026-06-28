@@ -195,7 +195,7 @@ async fn main() -> Result<(), EmbeddingError> {
     // `MockEmbeddingProvider` produces deterministic vectors with no network — handy in
     // tests and examples. Swap in a real provider behind the same trait.
     let provider = MockEmbeddingProvider::new();
-    let vectors = provider.embed(&["hello".to_string(), "world".to_string()]).await?;
+    let vectors = provider.embed(&["hello", "world"]).await?;
 
     assert_eq!(vectors.len(), 2);
     assert_eq!(vectors[0].len(), provider.dimensions());
