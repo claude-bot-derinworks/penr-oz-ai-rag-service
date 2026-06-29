@@ -199,10 +199,20 @@ pub enum VectorStoreError {
 /// *direction* rather than length.
 ///
 /// Returns `0.0` when either vector has zero magnitude (cosine is otherwise undefined)
-/// rather than producing a `NaN`. Only the overlapping prefix is compared, so callers
-/// are responsible for passing equal-length vectors; [`VectorStore`] implementations
-/// enforce that via [`VectorStoreError::DimensionMismatch`].
+/// rather than producing a `NaN`.
+///
+/// The two vectors must be the same length. [`VectorStore`] implementations enforce this
+/// up front via [`VectorStoreError::DimensionMismatch`], so a mismatch here signals a
+/// programmer error rather than bad data; it is caught by a `debug_assert` in debug and
+/// test builds. In a release build a mismatch is not checked and only the overlapping
+/// prefix is compared, which would silently skew the score — hence the assertion.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "cosine_similarity requires equal-length vectors"
+    );
+
     // Accumulate in f64 so high-dimensional sums don't lose precision before the final
     // ratio is taken; the result is narrowed back to f32 to match the stored vectors.
     let mut dot = 0.0_f64;

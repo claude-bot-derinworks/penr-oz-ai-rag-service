@@ -89,20 +89,28 @@ impl VectorStore for InMemoryVectorStore {
             }
         }
 
-        let mut results: Vec<SearchResult> = index
+        // Score every indexed vector by reference first, keeping only `(position, score)`
+        // pairs. The chunks themselves are cloned afterwards for just the top `k` hits, so
+        // a search never clones the whole store to throw most of it away.
+        let mut scored: Vec<(usize, f32)> = index
             .items
             .iter()
-            .map(|item| SearchResult {
-                chunk: item.chunk.clone(),
-                score: cosine_similarity(query, &item.embedding),
-            })
+            .enumerate()
+            .map(|(position, item)| (position, cosine_similarity(query, &item.embedding)))
             .collect();
 
         // Most similar first. `total_cmp` gives a total order over floats, so ties and
         // any stray NaN sort deterministically rather than triggering a panic.
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        results.truncate(k);
-        Ok(results)
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored.truncate(k);
+
+        Ok(scored
+            .into_iter()
+            .map(|(position, score)| SearchResult {
+                chunk: index.items[position].chunk.clone(),
+                score,
+            })
+            .collect())
     }
 
     async fn len(&self) -> Result<usize, VectorStoreError> {
