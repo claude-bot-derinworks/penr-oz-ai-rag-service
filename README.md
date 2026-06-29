@@ -207,6 +207,55 @@ Provider-specific code (HTTP, auth, request shaping) lives inside each implement
 adding a real provider is a matter of implementing `EmbeddingProvider` and returning
 `EmbeddingError` for failures.
 
+## Vector search
+
+Embedded chunks are indexed and retrieved through the `VectorStore` trait, the storage
+abstraction for the retrieval half of RAG: insert `EmbeddedChunk`s (a chunk plus its
+vector), then ask for the top-k most similar chunks to a query vector. Each
+`SearchResult` carries the matching chunk's text and metadata alongside a similarity
+score, so a retriever has everything it needs without a second lookup. Like
+`EmbeddingProvider`, the trait is async and object-safe (usable as
+`Arc<dyn VectorStore>`) and surfaces a dedicated `VectorStoreError`.
+
+`InMemoryVectorStore` is the built-in backend for development and tests: it keeps vectors
+in memory and answers searches with an exact cosine-similarity scan. A production
+deployment swaps in an approximate-nearest-neighbor service (Qdrant, Pinecone, pgvector,
+…) behind the same trait.
+
+```rust
+use penr_oz_ai_rag_service::{
+    EmbeddingProvider, EmbeddedChunk, InMemoryVectorStore, MockEmbeddingProvider, VectorStore,
+    VectorStoreError,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), VectorStoreError> {
+    let provider = MockEmbeddingProvider::new();
+    let store = InMemoryVectorStore::new();
+
+    // `chunks: Vec<Chunk>` comes from the ingestion pipeline. Embed each chunk's content
+    // and index it alongside the chunk.
+    let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+    let vectors = provider.embed(&texts).await.expect("embed");
+    let items: Vec<EmbeddedChunk> = chunks
+        .into_iter()
+        .zip(vectors)
+        .map(|(chunk, vector)| EmbeddedChunk::new(chunk, vector))
+        .collect();
+    store.insert(&items).await?;
+
+    // Embed the query the same way, then retrieve the 5 closest chunks.
+    let query = provider.embed(&["how does retrieval work?"]).await.expect("embed");
+    for hit in store.search(&query[0], 5).await? {
+        println!("{:.3}  {}", hit.score, hit.content());
+    }
+    Ok(())
+}
+```
+
+The first inserted vector fixes the store's dimensionality; later vectors and query
+vectors must match it, or the store returns `VectorStoreError::DimensionMismatch`.
+
 ## Project layout
 
 ```
@@ -219,10 +268,12 @@ src/
 ├── chunker/          Chunker trait, FixedSizeChunker
 ├── storage/          ChunkStore trait, InMemoryStorage, JsonlStorage
 ├── embedding/        EmbeddingProvider trait, EmbeddingError, MockEmbeddingProvider
+├── vector/           VectorStore trait, VectorStoreError, InMemoryVectorStore
 └── pipeline.rs       IngestionPipeline + builder
 tests/
 ├── ingestion.rs      end-to-end ingestion tests
-└── embedding.rs      embedding abstraction tests
+├── embedding.rs      embedding abstraction tests
+└── vector_search.rs  end-to-end embed-index-retrieve tests
 ```
 
 ## License

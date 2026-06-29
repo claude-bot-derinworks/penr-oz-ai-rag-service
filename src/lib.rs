@@ -19,7 +19,10 @@
 //!
 //! Embedding chunks for retrieval is handled separately, behind the
 //! [`EmbeddingProvider`] trait, so the embedding backend can be chosen independently of
-//! how documents are loaded, chunked, and stored.
+//! how documents are loaded, chunked, and stored. Embedded chunks are then indexed and
+//! retrieved through the [`VectorStore`] trait — top-k similarity search returns each
+//! matching [`Chunk`] with its score — backed by an in-process [`InMemoryVectorStore`]
+//! for development and tests.
 //!
 //! ## Example
 //!
@@ -41,6 +44,7 @@ pub mod error;
 pub mod loader;
 pub mod pipeline;
 pub mod storage;
+pub mod vector;
 
 pub use chunker::{Chunker, FixedSizeChunker};
 pub use document::{Chunk, ChunkMetadata, Document, Metadata};
@@ -49,3 +53,7 @@ pub use error::{RagError, Result};
 pub use loader::{Loader, LoaderRegistry, TextLoader};
 pub use pipeline::{FileReport, IngestReport, IngestionPipeline, PipelineBuilder};
 pub use storage::{ChunkStore, InMemoryStorage, JsonlStorage};
+pub use vector::{
+    cosine_similarity, EmbeddedChunk, Embedding, InMemoryVectorStore, SearchResult, VectorStore,
+    VectorStoreError,
+};
