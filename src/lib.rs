@@ -24,6 +24,11 @@
 //! matching [`Chunk`] with its score — backed by an in-process [`InMemoryVectorStore`]
 //! for development and tests.
 //!
+//! A [`Retriever`] composes those two abstractions into the read half of RAG: it
+//! validates a query, embeds it, and searches the vector store, returning the top
+//! matching chunks with their scores. It is the engine behind a `POST /retrieve`
+//! endpoint, with [`RetrievalRequest`] / [`RetrievalResponse`] as the wire shapes.
+//!
 //! ## Example
 //!
 //! ```
@@ -43,6 +48,7 @@ pub mod embedding;
 pub mod error;
 pub mod loader;
 pub mod pipeline;
+pub mod retrieval;
 pub mod storage;
 pub mod vector;
 
@@ -52,6 +58,10 @@ pub use embedding::{EmbeddingError, EmbeddingProvider, MockEmbeddingProvider};
 pub use error::{RagError, Result};
 pub use loader::{Loader, LoaderRegistry, TextLoader};
 pub use pipeline::{FileReport, IngestReport, IngestionPipeline, PipelineBuilder};
+pub use retrieval::{
+    RetrievalError, RetrievalRequest, RetrievalResponse, Retriever, DEFAULT_MAX_QUERY_CHARS,
+    DEFAULT_TOP_K,
+};
 pub use storage::{ChunkStore, InMemoryStorage, JsonlStorage};
 pub use vector::{
     cosine_similarity, EmbeddedChunk, Embedding, InMemoryVectorStore, SearchResult, VectorStore,

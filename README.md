@@ -2,10 +2,11 @@
 
 Implementation of a Retrieval-Augmented Generation (RAG) service for AI.
 
-This repository currently provides the **document ingestion pipeline**: the stage that
-turns raw source files into metadata-rich, retrievable chunks. It is written in Rust as
-a reusable library (`penr_oz_ai_rag_service`) with a thin command-line front-end
-(`penr-oz-rag`).
+This repository provides the **document ingestion pipeline** — the stage that turns raw
+source files into metadata-rich, retrievable chunks — and the **retrieval service** that
+answers queries over them through a `POST /retrieve` endpoint. It is written in Rust as
+a reusable library (`penr_oz_ai_rag_service`) with a command-line front-end
+(`penr-oz-rag`) that both ingests and serves.
 
 ## Overview
 
@@ -59,16 +60,30 @@ cargo fmt --check
 ## Command-line usage
 
 ```bash
-penr-oz-rag ingest <INPUT> [OPTIONS]
+penr-oz-rag ingest <INPUT> [OPTIONS]   # chunk documents (optionally persist as JSONL)
+penr-oz-rag serve  <INPUT> [OPTIONS]   # chunk + index documents, then serve POST /retrieve
 ```
+
+Options common to both commands:
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `<INPUT>` | — | Path to a file or directory to ingest. |
-| `-o, --output <FILE>` | _(none)_ | Write chunks as JSON Lines to `FILE`. If omitted, chunks are produced and counted in memory but not persisted. |
 | `--chunk-size <N>` | `800` | Maximum number of characters per chunk. |
 | `--overlap <N>` | `100` | Characters shared between consecutive chunks (must be `< chunk-size`). |
 | `--no-word-aware` | off | Make exact character cuts instead of preferring word boundaries. |
+
+`ingest` only:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-o, --output <FILE>` | _(none)_ | Write chunks as JSON Lines to `FILE`. If omitted, chunks are produced and counted in memory but not persisted. |
+
+`serve` only:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--addr <ADDR>` | `127.0.0.1:8080` | Address to bind the HTTP server to (port `0` picks a free port). |
 
 ### Examples
 
@@ -256,12 +271,95 @@ async fn main() -> Result<(), VectorStoreError> {
 The first inserted vector fixes the store's dimensionality; later vectors and query
 vectors must match it, or the store returns `VectorStoreError::DimensionMismatch`.
 
+## Retrieval
+
+`Retriever` composes the embedding and vector-store layers into the read half of RAG —
+the engine behind a `POST /retrieve` endpoint. Given a query it **validates** it, embeds
+it with an `EmbeddingProvider`, and searches a `VectorStore`, returning the top matching
+chunks with their similarity scores. Empty (or whitespace-only) and oversized queries are
+rejected with a dedicated `RetrievalError` *before* any embedding or search work happens,
+so bad input never reaches the backend.
+
+```rust
+use penr_oz_ai_rag_service::{
+    Chunk, InMemoryVectorStore, MockEmbeddingProvider, RetrievalError, Retriever,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), RetrievalError> {
+    let retriever = Retriever::new(MockEmbeddingProvider::new(), InMemoryVectorStore::new());
+
+    // `chunks: Vec<Chunk>` comes from the ingestion pipeline. `index` embeds each chunk's
+    // content and moves it into the store, so it becomes retrievable without a clone.
+    let chunks: Vec<Chunk> = Vec::new();
+    retriever.index(chunks).await?;
+
+    // Retrieve the 5 chunks most relevant to a query, each with its similarity score.
+    for hit in retriever.retrieve("how does retrieval work?", 5).await? {
+        println!("{:.3}  {}", hit.score, hit.content());
+    }
+    Ok(())
+}
+```
+
+The `RetrievalRequest` / `RetrievalResponse` pair is the JSON wire shape of the endpoint:
+deserialize the `POST` body into a `RetrievalRequest` (`top_k` defaults to `5` when
+omitted), call `Retriever::handle`, and serialize the `RetrievalResponse` back. The
+library stays web-framework-free — retrieval is a runtime-agnostic layer — while the
+`penr-oz-rag` binary hosts the endpoint with axum via the `serve` command. Validation
+errors map to `400 Bad Request` and backend failures to `5xx`.
+
+### The `POST /retrieve` endpoint
+
+`serve` ingests a file or directory, indexes every chunk, and answers retrieval queries:
+
+```bash
+# Start the service over a corpus
+penr-oz-rag serve ./docs --addr 127.0.0.1:8080
+
+# Top matching chunks with similarity scores
+curl -s localhost:8080/retrieve \
+  -H 'content-type: application/json' \
+  -d '{"query": "how does chunking work?", "top_k": 3}'
+
+# top_k omitted -> defaults to 5
+curl -s localhost:8080/retrieve -H 'content-type: application/json' \
+  -d '{"query": "cosine similarity"}'
+
+# Validation: empty or oversized queries -> 400 with an error message
+curl -si localhost:8080/retrieve -H 'content-type: application/json' \
+  -d '{"query": "   "}'
+```
+
+A `200` response carries the ranked results, most similar first:
+
+```json
+{
+  "results": [
+    {
+      "chunk": {
+        "id": "docs/intro.txt#0",
+        "content": "Retrieval augmented generation grounds a language model...",
+        "metadata": { "source": "docs/intro.txt", "chunk_index": 0, "...": "..." }
+      },
+      "score": 0.83
+    }
+  ]
+}
+```
+
+> **Note:** the service currently embeds with the deterministic, in-process
+> `MockEmbeddingProvider` — the only provider in the crate so far — so similarity is
+> hash-based rather than semantic. The endpoint mechanics (validation, ranking, `top_k`,
+> scores, error mapping) are all real; retrieval becomes semantic the moment a real
+> `EmbeddingProvider` implementation lands, with no changes to the handler.
+
 ## Project layout
 
 ```
 src/
 ├── lib.rs            crate root and re-exports
-├── main.rs           `penr-oz-rag` CLI
+├── main.rs           `penr-oz-rag` CLI (ingest + serve, POST /retrieve handler)
 ├── error.rs          RagError / Result
 ├── document.rs       Document, Chunk, ChunkMetadata
 ├── loader/           Loader trait, LoaderRegistry, TextLoader
@@ -269,11 +367,14 @@ src/
 ├── storage/          ChunkStore trait, InMemoryStorage, JsonlStorage
 ├── embedding/        EmbeddingProvider trait, EmbeddingError, MockEmbeddingProvider
 ├── vector/           VectorStore trait, VectorStoreError, InMemoryVectorStore
+├── retrieval.rs      Retriever, RetrievalRequest/Response, RetrievalError
 └── pipeline.rs       IngestionPipeline + builder
 tests/
 ├── ingestion.rs      end-to-end ingestion tests
 ├── embedding.rs      embedding abstraction tests
-└── vector_search.rs  end-to-end embed-index-retrieve tests
+├── vector_search.rs  end-to-end embed-index-retrieve tests
+├── retrieval.rs      end-to-end retriever tests (validate, embed, search)
+└── serve.rs          end-to-end HTTP tests against the served /retrieve endpoint
 ```
 
 ## License
