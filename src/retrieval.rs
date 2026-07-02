@@ -19,7 +19,8 @@
 //! [`Retriever::handle`], and serialize the [`RetrievalResponse`] back. No web framework
 //! is pulled in here — like the embedding and vector-store layers, retrieval is kept a
 //! plain, runtime-agnostic library so the binary that hosts the endpoint can choose its
-//! own HTTP stack.
+//! own HTTP stack. The crate's own `penr-oz-rag serve` command hosts exactly this
+//! endpoint.
 //!
 //! ## Example
 //!
