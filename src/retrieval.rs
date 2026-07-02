@@ -206,7 +206,9 @@ where
     ///
     /// The query is validated, embedded, and used to search the vector store. The result
     /// is the store's ranked [`SearchResult`]s — each chunk with its similarity score.
-    /// A `top_k` of `0`, or a search against an empty index, yields an empty `Vec`.
+    /// A `top_k` of `0`, or a search against an empty index, yields an empty `Vec`; the
+    /// `top_k == 0` case returns right after validation, without contacting the embedding
+    /// backend for a result that is empty by construction.
     ///
     /// # Errors
     /// - [`RetrievalError::EmptyQuery`] if `query` is empty or only whitespace.
@@ -231,6 +233,13 @@ where
                 chars,
                 max: self.max_query_chars,
             });
+        }
+
+        // Zero results are empty by construction, so don't spend an embedding-backend
+        // call (cost, rate limits) computing a vector that would never be searched.
+        // This sits after validation so invalid queries still fail regardless of `top_k`.
+        if top_k == 0 {
+            return Ok(Vec::new());
         }
 
         let embeddings = self.embedder.embed(&[query]).await?;
@@ -367,6 +376,27 @@ mod tests {
         );
         assert!(matches!(
             retriever.retrieve("  ", 5).await,
+            Err(RetrievalError::EmptyQuery)
+        ));
+    }
+
+    #[tokio::test]
+    async fn top_k_of_zero_short_circuits_before_embedding() {
+        // A valid query with `top_k == 0` is empty by construction, so the embedding
+        // backend must not be contacted at all — a failing provider proves it wasn't.
+        let retriever = Retriever::new(
+            MockEmbeddingProvider::failing("should not be reached"),
+            InMemoryVectorStore::new(),
+        );
+        assert!(retriever
+            .retrieve("a valid query", 0)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Validation still wins over the short-circuit: a bad query errors even at k == 0.
+        assert!(matches!(
+            retriever.retrieve("  ", 0).await,
             Err(RetrievalError::EmptyQuery)
         ));
     }
