@@ -29,6 +29,15 @@
 //! matching chunks with their scores. It is the engine behind a `POST /retrieve`
 //! endpoint, with [`RetrievalRequest`] / [`RetrievalResponse`] as the wire shapes.
 //!
+//! The generative half sits behind the [`LlmProvider`] trait, so the language-model
+//! backend can be swapped as freely as the embedding one. An [`AnswerGenerator`]
+//! composes a [`Retriever`] with an [`LlmProvider`]: it retrieves the top chunks, drops
+//! those below a minimum similarity score (so unrelated chunks never reach the model
+//! when retrieval confidence is low), builds a grounded prompt, and returns the model's
+//! answer together with [`SourceRef`]s to the chunks it drew on. It is the engine behind
+//! a `POST /answer` endpoint, with [`AnswerRequest`] / [`AnswerResponse`] as the wire
+//! shapes.
+//!
 //! ## Example
 //!
 //! ```
@@ -46,6 +55,8 @@ pub mod chunker;
 pub mod document;
 pub mod embedding;
 pub mod error;
+pub mod generation;
+pub mod llm;
 pub mod loader;
 pub mod pipeline;
 pub mod retrieval;
@@ -56,6 +67,11 @@ pub use chunker::{Chunker, FixedSizeChunker};
 pub use document::{Chunk, ChunkMetadata, Document, Metadata};
 pub use embedding::{EmbeddingError, EmbeddingProvider, MockEmbeddingProvider};
 pub use error::{RagError, Result};
+pub use generation::{
+    build_prompt, AnswerGenerator, AnswerRequest, AnswerResponse, GenerationError, SourceRef,
+    DEFAULT_MIN_SCORE, NO_CONTEXT_ANSWER,
+};
+pub use llm::{LlmError, LlmProvider, MockLlmProvider};
 pub use loader::{Loader, LoaderRegistry, TextLoader};
 pub use pipeline::{FileReport, IngestReport, IngestionPipeline, PipelineBuilder};
 pub use retrieval::{

@@ -7,7 +7,7 @@
 //! # Ingest a directory and write chunks as JSON Lines
 //! penr-oz-rag ingest ./docs --output chunks.jsonl --chunk-size 800 --overlap 100
 //!
-//! # Ingest a directory and serve retrieval over it
+//! # Ingest a directory and serve retrieval + answer generation over it
 //! penr-oz-rag serve ./docs --addr 127.0.0.1:8080
 //! ```
 
@@ -24,18 +24,20 @@ use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
 
 use penr_oz_ai_rag_service::{
-    ChunkStore, FixedSizeChunker, InMemoryStorage, InMemoryVectorStore, IngestReport,
-    IngestionPipeline, JsonlStorage, MockEmbeddingProvider, Result, RetrievalError,
-    RetrievalRequest, Retriever,
+    AnswerGenerator, AnswerRequest, ChunkStore, FixedSizeChunker, GenerationError, InMemoryStorage,
+    InMemoryVectorStore, IngestReport, IngestionPipeline, JsonlStorage, MockEmbeddingProvider,
+    MockLlmProvider, Result, RetrievalError, RetrievalRequest, Retriever, DEFAULT_MIN_SCORE,
 };
 
-/// The retriever the `serve` command hosts: the in-process embedding provider and vector
-/// store, shared across request handlers.
+/// The answer generator the `serve` command hosts — wrapping the retriever it also
+/// serves — with the in-process embedding provider, vector store, and LLM, shared
+/// across request handlers.
 ///
-/// `MockEmbeddingProvider` is the only provider in the crate today, so served similarity
-/// is deterministic-hash based rather than semantic; a real provider drops in here once
-/// one exists, without touching the handler.
-type ServedRetriever = Retriever<MockEmbeddingProvider, InMemoryVectorStore>;
+/// `MockEmbeddingProvider` and `MockLlmProvider` are the only providers in the crate
+/// today, so served similarity is deterministic-hash based rather than semantic and the
+/// served "answer" is the mock's echo of the grounded prompt; real providers drop in
+/// here once they exist, without touching the handlers.
+type ServedGenerator = AnswerGenerator<MockEmbeddingProvider, InMemoryVectorStore, MockLlmProvider>;
 
 /// Document ingestion and retrieval for a RAG service.
 #[derive(Debug, Parser)]
@@ -49,7 +51,8 @@ struct Cli {
 enum Command {
     /// Ingest a text file (or a directory of text files) into chunks.
     Ingest(IngestArgs),
-    /// Ingest a file or directory, index it, and serve `POST /retrieve` over HTTP.
+    /// Ingest a file or directory, index it, and serve `POST /retrieve` and
+    /// `POST /answer` over HTTP.
     Serve(ServeArgs),
 }
 
@@ -96,6 +99,11 @@ struct ServeArgs {
     /// Make exact character cuts instead of preferring word boundaries.
     #[arg(long)]
     no_word_aware: bool,
+
+    /// Minimum similarity score a retrieved chunk must reach to be used as answer
+    /// context. Requests can override it per call via `min_score`.
+    #[arg(long, default_value_t = DEFAULT_MIN_SCORE)]
+    min_score: f32,
 }
 
 fn main() -> ExitCode {
@@ -138,8 +146,8 @@ fn ingest(args: IngestArgs) -> Result<()> {
     Ok(())
 }
 
-/// Ingest `input` into memory, index every chunk, and serve `POST /retrieve` on
-/// `args.addr` until interrupted.
+/// Ingest `input` into memory, index every chunk, and serve `POST /retrieve` and
+/// `POST /answer` on `args.addr` until interrupted.
 fn serve(args: ServeArgs) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let chunker =
         FixedSizeChunker::new(args.chunk_size, args.overlap)?.word_aware(!args.no_word_aware);
@@ -154,45 +162,73 @@ fn serve(args: ServeArgs) -> std::result::Result<(), Box<dyn std::error::Error>>
         let indexed = retriever.index(store.into_chunks()).await?;
         println!("Indexed {indexed} chunk(s) for retrieval.");
 
+        let generator =
+            AnswerGenerator::new(retriever, MockLlmProvider::new()).with_min_score(args.min_score);
+
         let app = Router::new()
             .route("/retrieve", post(retrieve_handler))
-            .with_state(Arc::new(retriever));
+            .route("/answer", post(answer_handler))
+            .with_state(Arc::new(generator));
 
         let listener = tokio::net::TcpListener::bind(args.addr).await?;
         // Report the *bound* address, which differs from the requested one when the
         // caller asked for port 0.
-        println!(
-            "Serving POST /retrieve on http://{}",
-            listener.local_addr()?
-        );
+        let addr = listener.local_addr()?;
+        println!("Serving POST /retrieve on http://{addr}");
+        println!("Serving POST /answer on http://{addr}");
         axum::serve(listener, app).await?;
         Ok(())
     })
 }
 
 /// The `POST /retrieve` handler: deserialize a [`RetrievalRequest`], run it through the
-/// [`Retriever`], and serialize the [`RetrievalResponse`] — mapping validation failures
-/// to `400` and backend failures to `5xx`.
+/// generator's [`Retriever`], and serialize the [`RetrievalResponse`] — mapping
+/// validation failures to `400` and backend failures to `5xx`.
 async fn retrieve_handler(
-    State(retriever): State<Arc<ServedRetriever>>,
+    State(generator): State<Arc<ServedGenerator>>,
     Json(request): Json<RetrievalRequest>,
 ) -> Response {
-    match retriever.handle(&request).await {
+    match generator.retriever().handle(&request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => error_response(retrieval_status(&err), &err),
+    }
+}
+
+/// The `POST /answer` handler: deserialize an [`AnswerRequest`], run it through the
+/// [`AnswerGenerator`], and serialize the [`AnswerResponse`] — mapping validation
+/// failures to `400` and backend (embedding or LLM) failures to `5xx`.
+async fn answer_handler(
+    State(generator): State<Arc<ServedGenerator>>,
+    Json(request): Json<AnswerRequest>,
+) -> Response {
+    match generator.handle(&request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(err) => {
             let status = match &err {
-                RetrievalError::EmptyQuery | RetrievalError::QueryTooLong { .. } => {
-                    StatusCode::BAD_REQUEST
-                }
-                RetrievalError::Embedding(_) | RetrievalError::EmbeddingCountMismatch { .. } => {
-                    StatusCode::BAD_GATEWAY
-                }
-                RetrievalError::VectorStore(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                GenerationError::Retrieval(err) => retrieval_status(err),
+                GenerationError::Llm(_) => StatusCode::BAD_GATEWAY,
             };
-            let body = serde_json::json!({ "error": err.to_string() });
-            (status, Json(body)).into_response()
+            error_response(status, &err)
         }
     }
+}
+
+/// Map a [`RetrievalError`] onto the HTTP status both endpoints use for it: validation
+/// failures are the client's fault (`400`), backend failures are not (`5xx`).
+fn retrieval_status(err: &RetrievalError) -> StatusCode {
+    match err {
+        RetrievalError::EmptyQuery | RetrievalError::QueryTooLong { .. } => StatusCode::BAD_REQUEST,
+        RetrievalError::Embedding(_) | RetrievalError::EmbeddingCountMismatch { .. } => {
+            StatusCode::BAD_GATEWAY
+        }
+        RetrievalError::VectorStore(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Serialize `err` into the JSON error body both endpoints share.
+fn error_response(status: StatusCode, err: &dyn std::error::Error) -> Response {
+    let body = serde_json::json!({ "error": err.to_string() });
+    (status, Json(body)).into_response()
 }
 
 /// Build a pipeline around `store`, ingest `input`, flush, and return the report along

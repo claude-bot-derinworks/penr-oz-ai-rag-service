@@ -3,10 +3,12 @@
 Implementation of a Retrieval-Augmented Generation (RAG) service for AI.
 
 This repository provides the **document ingestion pipeline** — the stage that turns raw
-source files into metadata-rich, retrievable chunks — and the **retrieval service** that
-answers queries over them through a `POST /retrieve` endpoint. It is written in Rust as
-a reusable library (`penr_oz_ai_rag_service`) with a command-line front-end
-(`penr-oz-rag`) that both ingests and serves.
+source files into metadata-rich, retrievable chunks — the **retrieval service** that
+answers queries over them through a `POST /retrieve` endpoint, and the **answer
+generation service** that grounds a language model in the retrieved context through a
+`POST /answer` endpoint. It is written in Rust as a reusable library
+(`penr_oz_ai_rag_service`) with a command-line front-end (`penr-oz-rag`) that both
+ingests and serves.
 
 ## Overview
 
@@ -43,6 +45,9 @@ replaced or extended independently:
 - Pluggable loaders, chunkers, and storage backends via small traits.
 - Meaningful, specific error messages for invalid input (missing file, unsupported
   format, non-UTF-8 data, empty document, bad chunker configuration).
+- Grounded answer generation over the indexed corpus: retrieval, a confidence gate that
+  keeps low-scoring chunks out of the prompt, a pluggable `LlmProvider`, and source
+  references on every answer.
 
 ## Requirements
 
@@ -61,7 +66,7 @@ cargo fmt --check
 
 ```bash
 penr-oz-rag ingest <INPUT> [OPTIONS]   # chunk documents (optionally persist as JSONL)
-penr-oz-rag serve  <INPUT> [OPTIONS]   # chunk + index documents, then serve POST /retrieve
+penr-oz-rag serve  <INPUT> [OPTIONS]   # chunk + index documents, then serve POST /retrieve and POST /answer
 ```
 
 Options common to both commands:
@@ -84,6 +89,7 @@ Options common to both commands:
 | Option | Default | Description |
 | --- | --- | --- |
 | `--addr <ADDR>` | `127.0.0.1:8080` | Address to bind the HTTP server to (port `0` picks a free port). |
+| `--min-score <F>` | `0` | Minimum similarity score a retrieved chunk must reach to be used as answer context. Requests can override it per call via `min_score`. |
 
 ### Examples
 
@@ -354,12 +360,118 @@ A `200` response carries the ranked results, most similar first:
 > scores, error mapping) are all real; retrieval becomes semantic the moment a real
 > `EmbeddingProvider` implementation lands, with no changes to the handler.
 
+## Answer generation
+
+`AnswerGenerator` composes a `Retriever` with an `LlmProvider` into the generative half
+of RAG — the engine behind a `POST /answer` endpoint. Given a question it:
+
+1. **retrieves** the top-k chunks (validation included, exactly as `/retrieve` does),
+2. **gates by confidence** — chunks scoring below a minimum similarity are dropped, so
+   unrelated chunks never reach the model when retrieval confidence is low,
+3. **builds a grounded prompt** (`build_prompt`) from the surviving passages, numbered
+   and attributed, instructing the model to answer only from them,
+4. **calls the configured `LlmProvider`**, and
+5. returns the answer together with **source references** (`SourceRef`: chunk id, source
+   document, chunk index, similarity score) for the exact chunks the prompt used.
+
+If *no* chunk clears the gate, the model is not called at all: the response carries the
+sentinel `NO_CONTEXT_ANSWER` and an empty source list, so the generator refuses to
+answer from context it does not trust rather than prompting the model with noise.
+
+The `LlmProvider` trait mirrors `EmbeddingProvider`: async, object-safe
+(`Box<dyn LlmProvider>`), with a dedicated `LlmError` — so a hosted model is a drop-in
+implementation. `MockLlmProvider` is the built-in, deterministic stand-in: by default it
+echoes the prompt back (which lets tests assert on exactly what the model was shown),
+`with_reply` fixes a canned answer, and `failing` exercises error paths.
+
+```rust
+use penr_oz_ai_rag_service::{
+    AnswerGenerator, Chunk, GenerationError, InMemoryVectorStore, MockEmbeddingProvider,
+    MockLlmProvider, Retriever,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), GenerationError> {
+    let retriever = Retriever::new(MockEmbeddingProvider::new(), InMemoryVectorStore::new());
+
+    // `chunks: Vec<Chunk>` comes from the ingestion pipeline.
+    let chunks: Vec<Chunk> = Vec::new();
+    retriever.index(chunks).await?;
+
+    // `with_min_score` sets the default confidence gate; tune it per embedding model.
+    let generator = AnswerGenerator::new(retriever, MockLlmProvider::new());
+
+    // Retrieve up to 5 chunks, keep those scoring >= 0.25, prompt the model, answer.
+    let response = generator.answer("how does retrieval work?", 5, 0.25).await?;
+    println!("{}", response.answer);
+    for source in &response.sources {
+        println!("  [{}] {} (score {:.3})", source.id, source.source, source.score);
+    }
+    Ok(())
+}
+```
+
+The `AnswerRequest` / `AnswerResponse` pair is the JSON wire shape of the endpoint:
+deserialize the `POST` body into an `AnswerRequest` (`top_k` defaults to `5` and
+`min_score` to the generator's threshold when omitted), call `AnswerGenerator::handle`,
+and serialize the `AnswerResponse` back. Validation errors map to `400 Bad Request`,
+embedding/LLM backend failures to `502`, and vector-store failures to `500`.
+
+### The `POST /answer` endpoint
+
+`serve` hosts answering next to retrieval, over the same indexed corpus:
+
+```bash
+# Start the service over a corpus (optionally tune the confidence gate)
+penr-oz-rag serve ./docs --addr 127.0.0.1:8080 --min-score 0.25
+
+# A grounded answer with source references
+curl -s localhost:8080/answer \
+  -H 'content-type: application/json' \
+  -d '{"query": "how does chunking work?", "top_k": 3}'
+
+# Per-request confidence gate: exclude weakly related chunks from the prompt
+curl -s localhost:8080/answer -H 'content-type: application/json' \
+  -d '{"query": "how does chunking work?", "min_score": 0.5}'
+
+# Validation: empty or oversized queries -> 400 with an error message
+curl -si localhost:8080/answer -H 'content-type: application/json' \
+  -d '{"query": "   "}'
+```
+
+A `200` response carries the answer and the chunks it was grounded in:
+
+```json
+{
+  "answer": "Chunking splits each document into fixed-size, overlapping windows...",
+  "sources": [
+    {
+      "id": "docs/intro.txt#0",
+      "source": "docs/intro.txt",
+      "chunk_index": 0,
+      "score": 0.83
+    }
+  ]
+}
+```
+
+When no retrieved chunk clears the minimum score, the response is still `200`, with
+`"sources": []` and the fixed `NO_CONTEXT_ANSWER` text as the answer — the model is
+never shown low-confidence context.
+
+> **Note:** the service currently generates with the deterministic, in-process
+> `MockLlmProvider` — the only provider in the crate so far — which echoes the grounded
+> prompt rather than writing prose. The endpoint mechanics (retrieval, confidence
+> gating, prompt building, source attribution, error mapping) are all real; answers
+> become fluent the moment a real `LlmProvider` implementation lands, with no changes to
+> the handler.
+
 ## Project layout
 
 ```
 src/
 ├── lib.rs            crate root and re-exports
-├── main.rs           `penr-oz-rag` CLI (ingest + serve, POST /retrieve handler)
+├── main.rs           `penr-oz-rag` CLI (ingest + serve, POST /retrieve + /answer handlers)
 ├── error.rs          RagError / Result
 ├── document.rs       Document, Chunk, ChunkMetadata
 ├── loader/           Loader trait, LoaderRegistry, TextLoader
@@ -368,13 +480,16 @@ src/
 ├── embedding/        EmbeddingProvider trait, EmbeddingError, MockEmbeddingProvider
 ├── vector/           VectorStore trait, VectorStoreError, InMemoryVectorStore
 ├── retrieval.rs      Retriever, RetrievalRequest/Response, RetrievalError
+├── llm/              LlmProvider trait, LlmError, MockLlmProvider
+├── generation.rs     AnswerGenerator, AnswerRequest/Response, SourceRef, build_prompt
 └── pipeline.rs       IngestionPipeline + builder
 tests/
 ├── ingestion.rs      end-to-end ingestion tests
 ├── embedding.rs      embedding abstraction tests
 ├── vector_search.rs  end-to-end embed-index-retrieve tests
 ├── retrieval.rs      end-to-end retriever tests (validate, embed, search)
-└── serve.rs          end-to-end HTTP tests against the served /retrieve endpoint
+├── generation.rs     end-to-end answer-generation tests (gate, prompt, attribute)
+└── serve.rs          end-to-end HTTP tests against the served /retrieve + /answer endpoints
 ```
 
 ## License
