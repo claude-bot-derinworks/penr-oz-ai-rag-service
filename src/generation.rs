@@ -170,20 +170,24 @@ pub struct AnswerResponse {
 /// the corpus. Exposed as a plain function so alternative generators (or tests) can
 /// reuse or inspect the exact prompt shape.
 pub fn build_prompt(query: &str, context: &[SearchResult]) -> String {
+    use std::fmt::Write;
+
     let mut prompt = String::from(
         "Answer the question using only the numbered context passages below. \
          If the passages do not contain the answer, say so instead of guessing.\n\nContext:\n",
     );
     for (index, hit) in context.iter().enumerate() {
-        prompt.push_str(&format!(
-            "[{}] {} (score {:.3})\n{}\n\n",
+        // Writing into a String is infallible, so the fmt::Result is safe to ignore.
+        let _ = writeln!(
+            prompt,
+            "[{}] {} (score {:.3})\n{}\n",
             index + 1,
             hit.chunk.id,
             hit.score,
             hit.chunk.content
-        ));
+        );
     }
-    prompt.push_str(&format!("Question: {query}\nAnswer:"));
+    let _ = write!(prompt, "Question: {query}\nAnswer:");
     prompt
 }
 
@@ -262,9 +266,11 @@ where
         min_score: f32,
     ) -> Result<AnswerResponse, GenerationError> {
         let hits = self.retriever.retrieve(query, top_k).await?;
+        // Hits arrive most similar first (the `VectorStore::search` contract), so the
+        // gate can stop at the first hit below the threshold instead of scanning all.
         let context: Vec<SearchResult> = hits
             .into_iter()
-            .filter(|hit| hit.score >= min_score)
+            .take_while(|hit| hit.score >= min_score)
             .collect();
 
         if context.is_empty() {
