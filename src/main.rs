@@ -172,10 +172,11 @@ fn serve(args: ServeArgs) -> std::result::Result<(), Box<dyn std::error::Error>>
 
         let listener = tokio::net::TcpListener::bind(args.addr).await?;
         // Report the *bound* address, which differs from the requested one when the
-        // caller asked for port 0.
+        // caller asked for port 0. Keep this a single line, printed last: readers
+        // (like the integration tests) treat it as the readiness signal and may stop
+        // consuming stdout once they see it.
         let addr = listener.local_addr()?;
-        println!("Serving POST /retrieve on http://{addr}");
-        println!("Serving POST /answer on http://{addr}");
+        println!("Serving POST /retrieve and POST /answer on http://{addr}");
         axum::serve(listener, app).await?;
         Ok(())
     })

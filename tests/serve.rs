@@ -48,10 +48,15 @@ fn start_server(corpus: &std::path::Path) -> (ServerGuard, String) {
             .next()
             .expect("server exited before reporting its address")
             .expect("server stdout is utf-8");
-        if let Some(rest) = line.strip_prefix("Serving POST /retrieve on http://") {
+        if let Some(rest) = line.strip_prefix("Serving POST /retrieve and POST /answer on http://")
+        {
             break rest.trim().to_string();
         }
     };
+    // Keep draining stdout for the server's lifetime. Dropping the pipe here would
+    // close its read end, and any later server print would hit EPIPE — `println!`
+    // panics on that, killing the server mid-test.
+    std::thread::spawn(move || for _ in lines {});
     (guard, addr)
 }
 
